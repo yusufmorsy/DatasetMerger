@@ -1,0 +1,21 @@
+<!-- templates/index.html -->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>COCO Dataset Merger</title>
+</head>
+<body>
+  <h1>Merge Two COCO Datasets</h1>
+  <form action="/merge" method="post" enctype="multipart/form-data">
+    <label for="fileA">Dataset A (ZIP containing *_annotations.coco.json + images/):</label><br>
+    <input type="file" id="fileA" name="fileA" accept=".zip" required /><br><br>
+
+    <label for="fileB">Dataset B (ZIP containing *_annotations.coco.json + images/):</label><br>
+    <input type="file" id="fileB" name="fileB" accept=".zip" required /><br><br>
+
+    <button type="submit">Merge &amp; Download</button>
+  </form>
+</body>
+</html>

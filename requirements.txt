@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-multipart
+jinja2
+python-dotenv
+
+# Hugging Face & PyTorch for LLaMA 2
+transformers>=4.31.0
+torch>=2.0.0
+sentencepiece
