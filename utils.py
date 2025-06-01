@@ -1,281 +1,233 @@
 # utils.py
 
+from llama_cpp import Llama
 import json
 import shutil
 from pathlib import Path
+from typing import List, Dict, Optional, Tuple
 
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+LOCAL_LLAMA_PATH = "/Users/yusufmorsy/llama-ggml/llama-2-7b-q8_0.ggufv3.bin"
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 1) Load the LLaMA 2 chat model and tokenizer once at module import time.
-#    We assume you have already downloaded "meta-llama/Llama-2-7b-chat" locally
-#    or are able to pull it from Hugging Face. If you want to point to a
-#    local folder, replace the string below with that path.
-# ──────────────────────────────────────────────────────────────────────────────
-
-MODEL_NAME = "meta-llama/Llama-2-7b-chat"
-
-# Device selection: use GPU if available, else CPU
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-# Load tokenizer and model
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
-    device_map="auto" if DEVICE == "cuda" else None,
+llm = Llama(
+    model_path=LOCAL_LLAMA_PATH,
+    n_ctx=2048,
+    verbose=False,
 )
-model.to(DEVICE)
-model.eval()
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 2) Replace OpenAI‐based get_label_mapping(...) with LLaMA 2 inference.
-#
-#    We structure the prompt in the “LLaMA 2 chat” format:
-#      <s>[INST] <<SYS>> ...system prompt... <</SYS>>
-#      user prompt [/INST]
-#    Then generate and parse the JSON output.
-# ──────────────────────────────────────────────────────────────────────────────
-
-def get_label_mapping(names_A: list[str], names_B: list[str]) -> dict[str, str | None]:
-    """
-    Ask LLaMA 2‐chat to return a JSON mapping from each name in names_A to its best match in names_B.
-    If no match is found, the value should be null.
-    """
-    system_prompt = "You are a helpful assistant that maps category names from List A to best matches in List B."
-    user_prompt = (
-        f"List A: {names_A}\n"
-        f"List B: {names_B}\n\n"
-        "Please output a JSON object where each key is a name from List A and its value is the best match from List B.\n"
-        "If no good match exists, set the value to null.\n"
-        "Be case‐insensitive. For example:\n"
-        '{ "red": "r", "paper": "Paper", "foo": null }\n'
-        "Provide only the JSON object in your response."
-    )
-
-    # Build the LLaMA 2 “chat” style prompt
-    full_prompt = (
-        "<s>[INST] <<SYS>>\n"
-        + system_prompt
-        + "\n<</SYS>>\n"
-        + user_prompt
-        + " [/INST]"
-    )
-
-    # Tokenize & run generation
-    inputs = tokenizer(
-        full_prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=tokenizer.model_max_length - 1,
-    )
-    input_ids = inputs["input_ids"].to(DEVICE)
-    attention_mask = inputs["attention_mask"].to(DEVICE)
-
-    # Generate up to 512 new tokens (adjust if your JSON is very large)
-    generated_ids = model.generate(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        max_new_tokens=512,
-        temperature=0.0,      # deterministic
-        do_sample=False,      # greedy
-        eos_token_id=tokenizer.eos_token_id,
-    )
-
-    # Decode output (skip special tokens)
-    decoded = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-
-    # The model’s response will include everything after the prompt.
-    # We need to extract the JSON substring.
-    # Often, the JSON begins with '{' and ends with '}', so find the first '{' and last '}'.
-    try:
-        first_brace = decoded.index("{")
-        last_brace = decoded.rindex("}")
-        json_str = decoded[first_brace : last_brace + 1]
-    except ValueError:
-        # Fallback: assume entire decoded is JSON
-        json_str = decoded.strip()
-
-    # Parse JSON
-    mapping = json.loads(json_str)
-    # Convert any explicit "null" → None
-    for k, v in list(mapping.items()):
-        if v is None:
-            mapping[k] = None
-        elif isinstance(v, str) and v.lower() == "null":
-            mapping[k] = None
-
-    return mapping
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 3) The remainder of utils.py is unchanged from before:
-#    – load_coco_json
-#    – extract_categories
-#    – build_unified_categories
-#    – remap_images
-#    – remap_annotations
-#    – copy_and_rename_images
-#    – save_coco_json
+# 2) Load a COCO JSON from disk
 # ──────────────────────────────────────────────────────────────────────────────
-
-def load_coco_json(json_path: Path) -> dict:
-    with open(json_path, "r", encoding="utf-8") as f:
+def load_coco_json(path: Path) -> Dict:
+    with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def extract_categories(coco: dict) -> dict[int, tuple[str, str]]:
-    return {
-        cat["id"]: (cat["name"], cat.get("supercategory", ""))
-        for cat in coco.get("categories", [])
-    }
+# ──────────────────────────────────────────────────────────────────────────────
+# 3) Extract categories from a loaded COCO JSON.
+#    Returns a mapping { category_id: (category_name, supercategory) }.
+# ──────────────────────────────────────────────────────────────────────────────
+def extract_categories(coco: Dict) -> Dict[int, Tuple[str, str]]:
+    cats: Dict[int, Tuple[str, str]] = {}
+    for cat in coco.get("categories", []):
+        cats[cat["id"]] = (cat["name"], cat.get("supercategory", ""))
+    return cats
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 4) Use LLaMA 2 to “match” category names from A → B.
+#    names_A and names_B are each List[str].
+#    Return Dict[name_in_A, matching_name_in_B_or_None].
+# ──────────────────────────────────────────────────────────────────────────────
+def get_label_mapping(names_A: List[str], names_B: List[str]) -> Dict[str, Optional[str]]:
+    prompt_text = f"""
+Below are two lists of COCO category names for Dataset A and Dataset B.
+Your job is to tell me which names match. If a name in A corresponds to a name in B, return the B-name. If no reliable match, return null.
+
+Dataset A names:
+{json.dumps(names_A, indent=2)}
+
+Dataset B names:
+{json.dumps(names_B, indent=2)}
+
+Please output a JSON dict mapping each name in A (as key) to the matching name in B (or null). For example:
+{{ "cat": "feline", "dog": null, ... }}
+""".strip()
+
+    # Call llama_cpp
+    response = llm.create_completion(
+        prompt=prompt_text,
+        max_tokens=512,
+        temperature=0.0,
+    )
+    text = response["choices"][0]["text"].strip()
+    return json.loads(text)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 5) Build unified categories list and remapping tables.
+#
+#    - catsA, catsB: Dict[int, (name, supercategory)] from extract_categories().
+#    - name_map_A_to_B: Dict[name_in_A, matched_name_in_B_or_None] from step 4.
+#
+#    Return: (
+#       unified_categories: List[{"id": int, "name": str, "supercategory": str}],
+#       remap_A: Dict[old_A_cat_id, new_unified_id],
+#       remap_B: Dict[old_B_cat_id, new_unified_id]
+#    )
+# ──────────────────────────────────────────────────────────────────────────────
 def build_unified_categories(
-    cats_A: dict[int, tuple[str, str]],
-    cats_B: dict[int, tuple[str, str]],
-    name_map_A_to_B: dict[str, str | None],
-) -> tuple[list[dict], dict[int, int], dict[int, int]]:
-    unified = []
-    remap_A = {}
-    remap_B = {}
+    catsA: Dict[int, Tuple[str, str]],
+    catsB: Dict[int, Tuple[str, str]],
+    name_map_A_to_B: Dict[str, Optional[str]],
+) -> Tuple[List[Dict], Dict[int, int], Dict[int, int]]:
+    unified: List[Dict] = []
+    remap_A: Dict[int, int] = {}
+    remap_B: Dict[int, int] = {}
     next_id = 1
 
-    for old_id_A, (nameA, superA) in cats_A.items():
-        matchedB = name_map_A_to_B.get(nameA)
-        if matchedB:
-            candidates = [
-                bid
-                for bid, (nB, _) in cats_B.items()
-                if nB.lower() == matchedB.lower()
-            ]
-            if candidates:
-                old_id_B = candidates[0]
-                if old_id_B in remap_B:
-                    new_id = remap_B[old_id_B]
-                    remap_A[old_id_A] = new_id
-                    continue
-                unified.append({"id": next_id, "name": nameA, "supercategory": superA})
-                remap_A[old_id_A] = next_id
-                remap_B[old_id_B] = next_id
-                next_id += 1
-            else:
-                unified.append({"id": next_id, "name": nameA, "supercategory": superA})
-                remap_A[old_id_A] = next_id
-                next_id += 1
+    # 5a) Add categories from A, merging if name_map_A_to_B says so
+    for cidA, (nameA, superA) in catsA.items():
+        matched = name_map_A_to_B.get(nameA)
+        if matched is not None and matched in {v[0] for v in catsB.values()}:
+            # Find B’s category ID
+            for cidB, (nameB, superB) in catsB.items():
+                if nameB == matched:
+                    unified.append({"id": next_id, "name": nameA, "supercategory": superA})
+                    remap_A[cidA] = next_id
+                    remap_B[cidB] = next_id
+                    next_id += 1
+                    break
         else:
+            # No match → add A’s category as-is
             unified.append({"id": next_id, "name": nameA, "supercategory": superA})
-            remap_A[old_id_A] = next_id
+            remap_A[cidA] = next_id
             next_id += 1
 
-    for old_id_B, (nameB, superB) in cats_B.items():
-        if old_id_B in remap_B:
-            continue
-        unified.append({"id": next_id, "name": nameB, "supercategory": superB})
-        remap_B[old_id_B] = next_id
-        next_id += 1
+    # 5b) Add any B categories that weren’t merged above
+    for cidB, (nameB, superB) in catsB.items():
+        if cidB not in remap_B:
+            unified.append({"id": next_id, "name": nameB, "supercategory": superB})
+            remap_B[cidB] = next_id
+            next_id += 1
 
     return unified, remap_A, remap_B
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 6) Remap image IDs so A and B don’t collide:
+#
+#    - cocoA_images, cocoB_images: List[{"id": int, "file_name": str, …}]
+#    Returns:
+#      merged_images: List[{"id": int, "file_name": str, …}]  # new IDs
+#      img_id_map_A: Dict[old_A_id, new_id]
+#      img_id_map_B: Dict[old_B_id, new_id]
+# ──────────────────────────────────────────────────────────────────────────────
 def remap_images(
-    images_A: list[dict],
-    images_B: list[dict],
-) -> tuple[list[dict], dict[int, int], dict[int, int]]:
-    merged_images = []
-    image_map_A = {}
-    image_map_B = {}
-    next_img_id = 1
+    cocoA_images: List[Dict],
+    cocoB_images: List[Dict],
+) -> Tuple[List[Dict], Dict[int, int], Dict[int, int]]:
+    merged: List[Dict] = []
+    img_id_map_A: Dict[int, int] = {}
+    img_id_map_B: Dict[int, int] = {}
+    next_id = 1
 
-    for img in images_A:
-        old_id = img["id"]
-        new_id = next_img_id
-        image_map_A[old_id] = new_id
-        new_entry = img.copy()
-        new_entry["id"] = new_id
-        orig_name = img["file_name"]
-        new_fname = f"A_{orig_name}"
-        new_entry["file_name"] = new_fname
-        new_entry["source"] = "A"
-        new_entry["orig_file_name"] = orig_name
-        merged_images.append(new_entry)
-        next_img_id += 1
+    for img in cocoA_images:
+        img_id_map_A[img["id"]] = next_id
+        new_img = img.copy()
+        new_img["id"] = next_id
+        merged.append(new_img)
+        next_id += 1
 
-    for img in images_B:
-        old_id = img["id"]
-        new_id = next_img_id
-        image_map_B[old_id] = new_id
-        new_entry = img.copy()
-        new_entry["id"] = new_id
-        orig_name = img["file_name"]
-        new_fname = f"B_{orig_name}"
-        new_entry["file_name"] = new_fname
-        new_entry["source"] = "B"
-        new_entry["orig_file_name"] = orig_name
-        merged_images.append(new_entry)
-        next_img_id += 1
+    for img in cocoB_images:
+        img_id_map_B[img["id"]] = next_id
+        new_img = img.copy()
+        new_img["id"] = next_id
+        merged.append(new_img)
+        next_id += 1
 
-    return merged_images, image_map_A, image_map_B
+    return merged, img_id_map_A, img_id_map_B
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 7) Remap and merge annotations:
+#
+#    - cocoA_annos, cocoB_annos: List[{"id": int,"image_id": int,"category_id": int,…}]
+#    - img_map_A, img_map_B: Dict[old_image_id, new_image_id] from step 6
+#    - cat_map_A, cat_map_B: Dict[old_cat_id, new_cat_id] from step 5
+#
+#    Returns: merged_annotations: List[{"id": int,"image_id": int,"category_id": int,…}]
+# ──────────────────────────────────────────────────────────────────────────────
 def remap_annotations(
-    annos_A: list[dict],
-    annos_B: list[dict],
-    image_map_A: dict[int, int],
-    image_map_B: dict[int, int],
-    cat_map_A: dict[int, int],
-    cat_map_B: dict[int, int],
-) -> list[dict]:
-    merged_annos = []
-    next_anno_id = 1
+    cocoA_annos: List[Dict],
+    cocoB_annos: List[Dict],
+    img_map_A: Dict[int, int],
+    img_map_B: Dict[int, int],
+    cat_map_A: Dict[int, int],
+    cat_map_B: Dict[int, int],
+) -> List[Dict]:
+    merged_annos: List[Dict] = []
+    next_ann_id = 1
 
-    def rewrite(anno: dict, new_img: int, new_cat: int, new_id: int) -> dict:
+    for anno in cocoA_annos:
         new_anno = anno.copy()
-        new_anno["id"] = new_id
-        new_anno["image_id"] = new_img
-        new_anno["category_id"] = new_cat
-        return new_anno
+        new_anno["id"] = next_ann_id
+        new_anno["image_id"] = img_map_A[anno["image_id"]]
+        new_anno["category_id"] = cat_map_A[anno["category_id"]]
+        merged_annos.append(new_anno)
+        next_ann_id += 1
 
-    for anno in annos_A:
-        old_img = anno["image_id"]
-        old_cat = anno["category_id"]
-        new_img = image_map_A[old_img]
-        new_cat = cat_map_A[old_cat]
-        merged_annos.append(rewrite(anno, new_img, new_cat, next_anno_id))
-        next_anno_id += 1
-
-    for anno in annos_B:
-        old_img = anno["image_id"]
-        old_cat = anno["category_id"]
-        new_img = image_map_B[old_img]
-        new_cat = cat_map_B[old_cat]
-        merged_annos.append(rewrite(anno, new_img, new_cat, next_anno_id))
-        next_anno_id += 1
+    for anno in cocoB_annos:
+        new_anno = anno.copy()
+        new_anno["id"] = next_ann_id
+        new_anno["image_id"] = img_map_B[anno["image_id"]]
+        new_anno["category_id"] = cat_map_B[anno["category_id"]]
+        merged_annos.append(new_anno)
+        next_ann_id += 1
 
     return merged_annos
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 8) Copy & rename images into the final “images/” folder.
+#
+#    - extractA_images, extractB_images: Paths to each dataset’s images/ dir
+#    - merged_images: List[{"id": int, "file_name": str, …}] from step 6
+#    - output_images: Path where we write the new “images/” folder
+#
+#    We’ll prefix “A_” or “B_” to avoid filename collisions.
+# ──────────────────────────────────────────────────────────────────────────────
 def copy_and_rename_images(
     extractA_images: Path,
     extractB_images: Path,
-    merged_images: list[dict],
-    dest_images_dir: Path,
+    merged_images: List[Dict],
+    output_images: Path,
 ) -> None:
-    dest_images_dir.mkdir(parents=True, exist_ok=True)
-    for img in merged_images:
-        source = img["source"]
-        orig_name = img["orig_file_name"]
-        new_name = img["file_name"]
-        if source == "A":
-            src_path = extractA_images / orig_name
+    output_images.mkdir(parents=True, exist_ok=True)
+
+    # Helper: build a set of original A filenames for quick lookup
+    filenames_A = {p.name for p in extractA_images.iterdir()} if extractA_images.exists() else set()
+
+    for img_info in merged_images:
+        # Determine whether this image came from A or B by filename
+        fname = img_info["file_name"]
+        if fname in filenames_A:
+            src_folder = extractA_images
+            prefix = "A_"
         else:
-            src_path = extractB_images / orig_name
-        shutil.copy(src_path, dest_images_dir / new_name)
+            src_folder = extractB_images
+            prefix = "B_"
+
+        src_path = src_folder / fname
+        dst_fname = prefix + fname
+        dst_path = output_images / dst_fname
+        shutil.copyfile(src_path, dst_path)
 
 
-def save_coco_json(merged: dict, output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(merged, f, indent=2)
+# ──────────────────────────────────────────────────────────────────────────────
+# 9) Save a COCO dict back to disk, creating parent folders as needed
+# ──────────────────────────────────────────────────────────────────────────────
+def save_coco_json(coco: Dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(coco, f, indent=2)
