@@ -3,4 +3,4 @@ uvicorn[standard]
 python-multipart
 jinja2
 python-dotenv
-llama-cpp-python>=0.1.37
+openai
